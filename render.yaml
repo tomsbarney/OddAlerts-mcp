@@ -1,0 +1,16 @@
+# One-click hosting on Render (render.com). Push this folder to a GitHub repo,
+# then New > Blueprint in Render and pick the repo. Set the two secrets when asked.
+services:
+  - type: web
+    name: oddalerts-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py --http
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: ODDALERTS_API_TOKEN
+        sync: false
+      - key: MCP_PATH_SECRET
+        sync: false
