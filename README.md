@@ -1,6 +1,6 @@
 # OddAlerts for Claude
 
-An MCP server that lets Claude rank upcoming football fixtures for **goals, corners and cards** using your OddAlerts API token.
+An MCP server that lets Claude rank upcoming football fixtures for **goals, corners and BTTS**, and check value against bookmaker prices, using your OddAlerts API token.
 
 ## What Claude can do with it
 
