@@ -6,7 +6,7 @@ An MCP server that lets Claude rank upcoming football fixtures for **goals, corn
 
 | Tool | What it does |
 |---|---|
-| `find_top_fixtures` | Ranks upcoming fixtures by OddAlerts' probability for a market and line, e.g. corners over 9.5, cards over 3.5, goals over 2.5. Includes matching odds and referee. |
+| `find_top_fixtures` | Ranks upcoming fixtures for over goals (0.5–4.5), over corners (4.5–11.5) or BTTS, by OddAlerts' probability or by value (edge) against the bookmaker price. Filters out youth, women's and reserve games by default. |
 | `get_fixture` | Full detail for one game: probabilities, odds, stats, referee, head-to-head. |
 | `simulate_fixtures` | OddAlerts' 5,000-run simulation: win/draw/loss, BTTS, over 2.5, expected goals, likeliest scores. |
 | `list_fixtures` | Upcoming games with IDs, so you can find competition and team IDs to filter by. |
@@ -14,7 +14,7 @@ An MCP server that lets Claude rank upcoming football fixtures for **goals, corn
 
 Example prompts:
 - "Best 10 games for over 9.5 corners in the next 2 days"
-- "Which fixtures this weekend look strongest for over 3.5 cards? Check the referees too."
+- "Best value over 2.5 goals bets this weekend, odds of at least 1.6"
 - "Top over 2.5 goals games tomorrow, then run simulations on the top 5"
 
 ## Requirements
@@ -58,7 +58,9 @@ For **Claude Code**: `claude mcp add oddalerts -- python3 /FULL/PATH/TO/oddalert
 Keep the URL private: anyone with it can use your OddAlerts quota. Render's free tier sleeps when idle, so the first call after a break can take ~30 seconds.
 
 ## Notes
-- **Field names are discovered, not hard-coded.** OddAlerts' public docs don't list the corners and cards probability field names, so the server matches fields by keyword (`corner`, `card`, `goal`/`btts`) and line (`o95`, `over_3_5`, …). If a ranking comes back empty, ask Claude to run `discover_fields` with keyword "corner" or "card", then rank by the exact field it finds.
+- **Field names** (confirmed on the live API): goals `probability.o25` etc., corners `probability.o9_corners` = over 9.5 (10+), BTTS `probability.btts`. Matching prices come from `odds.total_goals.over_25`, `odds.total_corners.over_95` and `odds.btts.yes`.
+- **Cards.** OddAlerts' API has no card probabilities or card odds, so cards can't be ranked automatically. Claude can still pull the referee and past head-to-head card counts for a shortlist via `get_fixture`.
+- **Edge.** `edge_pct` = OddAlerts' probability minus the bookmaker's implied probability (with the margin removed when both over and under prices exist). Positive means the model rates the bet higher than the price does.
 - **Rate limits.** OddAlerts allows roughly 100 requests a minute. A ranking scans up to 4 pages of 250 fixtures (4 requests). The server retries automatically if it's throttled.
 - **Narrowing to European leagues.** Use `list_fixtures` to find the `competition_id` values for the leagues you follow, then ask Claude to filter by them. Up to 25 IDs per filter.
 - **Probabilities are model outputs, not guarantees.** Compare them with the bookmaker odds before staking anything.

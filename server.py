@@ -21,7 +21,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import Counter
 from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -31,21 +30,14 @@ BASE_URL = os.environ.get("ODDALERTS_BASE_URL", "https://data.oddalerts.com/api"
 ALL_INCLUDES = "probability,odds,stats,timings,correctScores,referee,h2h"
 MAX_TEXT = 40_000  # keep raw responses small enough for Claude to read
 
-# Words that identify each market in OddAlerts field names.
-MARKET_WORDS: dict[str, tuple[str, ...]] = {
-    "goals": ("goal", "btts"),
-    "corners": ("corner",),
-    "cards": ("card", "booking"),
-}
-
 mcp = MCPServer(
     name="oddalerts",
     instructions=(
         "Tools for OddAlerts football data. To find the best fixtures for a market, "
-        "call find_top_fixtures with market='goals', 'corners' or 'cards' and an optional "
-        "line (e.g. 2.5 goals, 9.5 corners, 3.5 cards). If the ranking field looks wrong, "
-        "call discover_fields once to see the exact field names OddAlerts returns, then pass "
-        "sort_field explicitly. Probabilities are OddAlerts model outputs, not certainties."
+        "call find_top_fixtures with market='goals', 'corners' or 'btts' and an optional line "
+        "(e.g. 2.5 goals, 9.5 corners). Use rank_by='edge' to find value against bookmaker prices. "
+        "OddAlerts has no card probabilities or odds; for cards, check referee and head-to-head via "
+        "get_fixture. Probabilities are OddAlerts model outputs, not certainties."
     ),
 )
 
@@ -153,31 +145,44 @@ def _num(v: Any) -> float | None:
     return None
 
 
-def _line_tokens(line: float) -> list[str]:
-    s = f"{line:g}"            # 2.5 -> "2.5", 10.5 -> "10.5"
-    compact = s.replace(".", "")  # "25", "105"
-    return [f"o{compact}", f"over{compact}", f"over_{compact}", f"over{s}", f"over_{s}", f"o_{compact}", s, s.replace(".", "_")]
+# OddAlerts field names (confirmed against the live API, Oct 2026):
+#   goals    probability.o05 … o45 (over 0.5 … 4.5), probability.btts
+#            odds.total_goals.over_25 / under_25, odds.btts.yes / no
+#   corners  probability.o4_corners … o11_corners  (o9 = over 9.5, i.e. 10+)
+#            odds.total_corners.over_95 / under_95
+#   cards    no probability or odds fields; only stats after full time
+DEFAULT_LINES = {"goals": 2.5, "corners": 9.5}
+NON_SENIOR = re.compile(r"(\bU\d{2}\b|\bW\b|\bII\b|\bIII\b|\bRes\.?\b|\bReserves?\b|\bYouth\b|\bAcademy\b|\bB\b$)", re.I)
 
 
-def _market_fields(flat: dict[str, Any], market: str, line: float | None) -> dict[str, float]:
-    words = MARKET_WORDS[market]
-    skip_roots = ("home_goals", "away_goals", "corners", "home_played", "away_played")  # result fields, not predictions
-    found: dict[str, float] = {}
-    for path, val in flat.items():
-        low = path.lower()
-        if low in skip_roots or not any(w in low for w in words):
-            continue
-        n = _num(val)
-        if n is None:
-            continue
-        if line is not None:
-            leaf = low.rsplit(".", 1)[-1]
-            if not any(t in leaf or t in low for t in _line_tokens(line)):
-                continue
-            if re.search(rf"(^|[._])u(nder)?_?{f'{line:g}'.replace('.', '')}", leaf):
-                continue  # skip the under side
-        found[path] = n
-    return found
+def _compact(line: float) -> str:
+    return f"{line:g}".replace(".", "")  # 2.5 -> "25", 9.5 -> "95"
+
+
+def _prob_field(market: str, line: float) -> str:
+    if market == "goals":
+        return f"probability.o{_compact(line)}"
+    return f"probability.o{int(line)}_corners"  # 9.5 -> o9_corners
+
+
+def _odds_fields(market: str, line: float) -> tuple[str, str]:
+    group = "total_goals" if market == "goals" else "total_corners"
+    c = _compact(line)
+    return f"odds.{group}.over_{c}", f"odds.{group}.under_{c}"
+
+
+def _value(prob: float | None, over: float | None, under: float | None) -> dict[str, Any]:
+    """Compare OddAlerts' probability with the bookmaker price (margin removed when both sides exist)."""
+    if prob is None or not over or over <= 1:
+        return {"over_odds": over, "implied_pct": None, "edge_pct": None}
+    implied = 100 / over
+    if under and under > 1:
+        implied = implied / (100 / over + 100 / under) * 100  # normalise out the bookmaker margin
+    return {"over_odds": over, "under_odds": under, "implied_pct": round(implied, 1), "edge_pct": round(prob - implied, 1)}
+
+
+def _is_senior(f: dict[str, Any]) -> bool:
+    return not any(NON_SENIOR.search(str(f.get(k) or "")) for k in ("home_name", "away_name"))
 
 
 def _ko(f: dict[str, Any]) -> str:
@@ -188,88 +193,107 @@ def _ko(f: dict[str, Any]) -> str:
 
 @mcp.tool()
 async def find_top_fixtures(
-    market: Literal["goals", "corners", "cards"],
+    market: Literal["goals", "corners", "btts", "cards"],
     line: float | None = None,
+    rank_by: Literal["probability", "edge"] = "probability",
     days_ahead: float = 2,
+    senior_men_only: bool = True,
     competitions: str | None = None,
     seasons: str | None = None,
     teams: str | None = None,
     has_odds: bool = True,
+    min_odds: float | None = None,
     limit: int = 15,
     sort_field: str | None = None,
     max_pages: int = 4,
 ) -> dict[str, Any]:
-    """Rank upcoming fixtures by OddAlerts' probability for a goals, corners or cards market.
+    """Rank upcoming fixtures for an over goals, over corners or BTTS bet using OddAlerts' model.
+
+    Each result shows OddAlerts' probability, the bookmaker over/under price, the bookmaker's
+    implied probability (margin removed) and the edge (model minus implied). Positive edge = value.
 
     Args:
-        market: "goals", "corners" or "cards".
-        line: Over line to rank by, e.g. 2.5 (goals), 9.5 (corners), 3.5 (cards). Omit to see every field for the market.
+        market: "goals" (over X.5), "corners" (over X.5), or "btts". "cards" is not supported by
+                OddAlerts' API (no card probabilities or odds) and returns guidance instead.
+        line: Goals 0.5-4.5 (default 2.5); corners 4.5-11.5 (default 9.5). Ignored for btts.
+        rank_by: "probability" (most likely) or "edge" (best value against the bookmaker price).
         days_ahead: How far ahead to look (OddAlerts serves up to 7 days).
-        competitions: Comma-separated OddAlerts competition IDs (max 25), e.g. to limit to European top flights.
-        seasons: Comma-separated OddAlerts season IDs (max 25).
-        teams: Comma-separated OddAlerts team IDs (max 25).
-        has_odds: Only fixtures with bookmaker odds (filters out obscure games). Default true.
+        senior_men_only: Drop U19/U21, women's, reserve and II teams. Default true.
+        competitions: Comma-separated OddAlerts competition IDs (max 25). Find them with list_fixtures.
+        seasons / teams: Comma-separated OddAlerts IDs (max 25 each).
+        has_odds: Only fixtures with bookmaker odds. Default true.
+        min_odds: Skip fixtures whose over price is below this (e.g. 1.5 to avoid very short prices).
         limit: How many fixtures to return.
-        sort_field: Exact flattened field to rank by, e.g. "probability.o95_corners". Use discover_fields to find it.
-        max_pages: Pages of 250 fixtures to scan. Each page is one API call.
+        sort_field: Advanced: rank by any exact field from discover_fields instead.
+        max_pages: Pages of 250 fixtures to scan (one API call each).
     """
+    if market == "cards":
+        return {
+            "message": (
+                "OddAlerts' API has no card probabilities and no card odds, so fixtures can't be ranked "
+                "for cards automatically. What is available: the referee and past card counts in "
+                "head-to-head meetings (get_fixture with include='referee,h2h'), and card counts "
+                "in finished matches. Shortlist fixtures (e.g. derbies, relegation games) and check those."
+            ),
+            "fixtures": [],
+        }
+
+    if market == "btts":
+        prob_field, over_f, under_f, ln = "probability.btts", "odds.btts.yes", "odds.btts.no", None
+    else:
+        ln = line if line is not None else DEFAULT_LINES[market]
+        if market == "corners" and not (4 <= ln <= 11.5):
+            return {"message": "OddAlerts provides corner probabilities for over 4.5 up to over 11.5 only.", "fixtures": []}
+        if market == "goals" and not (0.5 <= ln <= 4.5):
+            return {"message": "OddAlerts provides goals probabilities for over 0.5 up to over 4.5 only.", "fixtures": []}
+        prob_field = _prob_field(market, ln)
+        over_f, under_f = _odds_fields(market, ln)
+    prob_field = sort_field or prob_field
+
     fixtures = await _upcoming(
         include="probability,odds,referee", competitions=competitions, seasons=seasons,
         teams=teams, has_odds=has_odds, days_ahead=days_ahead, max_pages=max_pages,
     )
-    if not fixtures:
-        return {"message": "No upcoming fixtures matched those filters.", "fixtures": []}
+    scanned = len(fixtures)
+    if senior_men_only:
+        fixtures = [f for f in fixtures if _is_senior(f)]
 
-    per_fixture = []
-    field_counts: Counter[str] = Counter()
+    rows = []
     for f in fixtures:
         flat = _flatten(f)
-        fields = {sort_field: _num(flat.get(sort_field))} if sort_field else _market_fields(flat, market, line)
-        fields = {k: v for k, v in fields.items() if v is not None}
-        field_counts.update(k for k in fields if k.startswith("probability"))
-        per_fixture.append((f, flat, fields))
-
-    # Pick the ranking field: explicit, else the most common probability field for this market/line.
-    rank_by = sort_field or (field_counts.most_common(1)[0][0] if field_counts else None)
-    if not rank_by:
-        sample = sorted({k for _, flat, _ in per_fixture[:20] for k in flat if k.startswith("probability")})[:60]
-        return {
-            "message": (
-                f"No probability fields matched market '{market}'"
-                + (f" line {line:g}" if line is not None else "")
-                + ". Call discover_fields to see what OddAlerts returns, then retry with sort_field."
-            ),
-            "fixtures_scanned": len(fixtures),
-            "probability_fields_seen": sample,
-        }
-
-    ranked = sorted(
-        (x for x in per_fixture if _num(x[1].get(rank_by)) is not None),
-        key=lambda x: _num(x[1].get(rank_by)) or 0, reverse=True,
-    )[:limit]
-
-    results = []
-    for f, flat, fields in ranked:
-        odds = {k: v for k, v in flat.items() if k.startswith("odds") and any(w in k.lower() for w in MARKET_WORDS[market])}
-        results.append({
+        prob = _num(flat.get(prob_field))
+        if prob is None:
+            continue
+        val = _value(prob, _num(flat.get(over_f)), _num(flat.get(under_f)))
+        if min_odds and (val["over_odds"] is None or val["over_odds"] < min_odds):
+            continue
+        rows.append({
             "fixture_id": f.get("id"),
             "match": f"{f.get('home_name')} vs {f.get('away_name')}",
             "kickoff": _ko(f),
             "competition_id": f.get("competition_id"),
-            "positions": f"{f.get('home_position')} v {f.get('away_position')}",
-            "score": _num(flat.get(rank_by)),
-            "market_fields": dict(list(fields.items())[:12]),
-            "odds": dict(list(odds.items())[:12]) or None,
+            "league_positions": f"{f.get('home_position')} v {f.get('away_position')}",
+            "probability_pct": prob,
+            **val,
             "referee": flat.get("referee.name") or flat.get("referee.common_name"),
         })
 
+    if rank_by == "edge":
+        rows = [r for r in rows if r["edge_pct"] is not None]
+        rows.sort(key=lambda r: r["edge_pct"], reverse=True)
+    else:
+        rows.sort(key=lambda r: r["probability_pct"], reverse=True)
+
+    label = "Both teams to score" if market == "btts" else f"Over {ln:g} {market}"
     return {
-        "market": market,
-        "line": line,
+        "market": label,
+        "probability_field": prob_field,
+        "odds_field": over_f,
         "ranked_by": rank_by,
-        "fixtures_scanned": len(fixtures),
-        "other_fields_for_market": [k for k, _ in field_counts.most_common(15) if k != rank_by],
-        "fixtures": results,
+        "fixtures_scanned": scanned,
+        "fixtures_after_filters": len(rows),
+        "note": "probability_pct is OddAlerts' model; implied_pct is the bookmaker's price with margin removed; edge_pct = difference.",
+        "fixtures": rows[:limit],
     }
 
 
