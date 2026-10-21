@@ -139,14 +139,31 @@ async def main():
         assert t["pct_matches_over_3.5_cards"] == 100.0
         assert t["avg_corners_in_match"] == 10.0 and t["pct_matches_over_9.5_corners"] == 100.0
         assert len(t["matches"]) == 10 and t["matches"][0]["cards_for"] == 4
+        assert t["avg_goals_in_match"] == 2.0 and t["avg_goals_for"] == 1.0
+        assert t["pct_matches_over_2.5_goals"] == 0.0 and t["matches"][0]["goals_for"] == 1
 
         # find_cards_and_corners: Bayern v Leipzig (high cards) beats Brentford v Fulham (higher corners, few cards)
         r = await call("find_cards_and_corners", {"days_ahead": 2})
-        print("cards+corners:", [(f["match"], f["over_9.5_corners_pct"], f["expected_cards"],
-                                  f["cards_over_3.5_hit_rate_pct"], f["combined_score_pct"]) for f in r["fixtures"]])
+        print("corners+goals+cards:", [(f["match"], f["over_9.5_corners_pct"], f["over_2.5_goals_pct"], f["expected_cards"],
+                                        f["cards_over_3.5_hit_rate_pct"], f["combined_score_pct"]) for f in r["fixtures"]])
         assert [f["fixture_id"] for f in r["fixtures"]] == [3, 2, 1]
-        assert r["fixtures"][0]["combined_score_pct"] == 62.0
+        top = r["fixtures"][0]
+        assert top["combined_score_pct"] == 47.7  # 62 x 0.77 x 1.00
+        assert top["goals_over_odds"] == 2.2 and top["form_goals_in_match"] == 2.0
+        assert top["form_goals_over_2.5_rate_pct"] == 0.0 and "over 2.5 goals" in r["note"]
         assert r["fixtures"][2]["cards_over_3.5_hit_rate_pct"] == 0.0  # Brentford/Fulham: 2-3 card games
+
+        # goals switched off: corners x cards only
+        r = await call("find_cards_and_corners", {"days_ahead": 2, "goals_line": None})
+        assert r["fixtures"][0]["combined_score_pct"] == 62.0 and "over_2.5_goals_pct" not in r["fixtures"][0]
+        assert r["goals_market"] is None
+
+        # shortlist of 1 picks the best corners x goals game (Bayern 62x77 beats Brentford 71x58)
+        r = await call("find_cards_and_corners", {"days_ahead": 2, "shortlist": 1})
+        assert r["checked"] == 1 and r["fixtures"][0]["fixture_id"] == 3
+
+        r = await call("find_cards_and_corners", {"goals_line": 6.5})
+        assert "4.5" in r["message"]
 
         r = await call("find_top_fixtures", {"market": "corners"})
         assert r["fixtures"][0]["home_id"] == 10
