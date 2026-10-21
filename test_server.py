@@ -37,7 +37,35 @@ FIXTURES = [
 ]
 
 
+# Past matches per team: (yellow cards for, against, corners for, against). Team ids: home = i*10, away = i*10+1.
+CARD_LEVEL = {10: 1, 11: 1, 20: 2, 21: 2, 30: 3, 31: 3}
+
+
+def past_matches(team_id):
+    lvl = CARD_LEVEL.get(team_id, 2)
+    rows = []
+    for k in range(12):
+        home = k % 2 == 0
+        us = {"yellow_cards": lvl, "red_cards": 1 if k == 0 else 0, "corners": 6}
+        them = {"yellow_cards": lvl, "red_cards": 0, "corners": 4}
+        h, a = (us, them) if home else (them, us)
+        rows.append({
+            "id": 1000 + k, "home_id": team_id if home else 999, "away_id": 999 if home else team_id,
+            "home_name": f"T{team_id}" if home else "Opp", "away_name": "Opp" if home else f"T{team_id}",
+            "home_goals": 1, "away_goals": 1, "unix": NOW - (k + 1) * 86400 * 7, "is_friendly": k == 1,
+            "stats": {f"home_{s}": v for s, v in h.items()} | {f"away_{s}": v for s, v in a.items()},
+        })
+    # a future fixture and one without stats, both must be ignored
+    rows.insert(0, {"id": 2000, "home_id": team_id, "away_id": 999, "home_goals": None, "unix": NOW + 86400, "stats": None})
+    rows.append({"id": 2001, "home_id": team_id, "away_id": 999, "home_goals": 0, "away_goals": 0,
+                 "unix": NOW - 99 * 86400 * 7, "stats": {}})
+    return rows
+
+
 def fake_get(path, params):
+    if path.startswith("fixtures/team/"):
+        assert params["include"] == "stats" and params["order"] == "desc"
+        return {"info": {"next_page_url": None}, "data": past_matches(int(path.rsplit("/", 1)[1]))}
     if path == "fixtures/upcoming":
         return {"info": {"page": 1, "per_page": 250, "count": len(FIXTURES), "next_page_url": None}, "data": FIXTURES}
     if path.startswith("fixtures/"):
@@ -60,7 +88,8 @@ async def main():
         tools = await client.list_tools()
         names = sorted(t.name for t in tools.tools)
         print("tools:", names)
-        assert names == ["discover_fields", "find_top_fixtures", "get_fixture", "list_fixtures", "simulate_fixtures"]
+        assert names == ["discover_fields", "find_cards_and_corners", "find_top_fixtures", "get_fixture",
+                         "list_fixtures", "simulate_fixtures", "team_form"]
 
         async def call(name, args):
             res = await client.call_tool(name, args)
@@ -98,6 +127,29 @@ async def main():
 
         r = await call("list_fixtures", {"days_ahead": 2})
         assert r["count"] == 4
+
+        # team_form: 10 matches used (friendly, future and no-stats rows skipped)
+        r = await call("team_form", {"team_ids": [30], "include_matches": True})
+        t = r["teams"][0]
+        print("team_form:", {k: v for k, v in t.items() if k != "matches"})
+        assert t["team"] == "T30" and t["matches_used"] == 10
+        assert t["avg_cards_in_match"] == 6.1  # 3 + 3 each game, plus one red in the latest
+        assert t["avg_cards_for"] == 3.1 and t["avg_cards_against"] == 3.0
+        assert t["avg_corners_for"] == 6.0 and t["avg_corners_against"] == 4.0
+        assert t["pct_matches_over_3.5_cards"] == 100.0
+        assert t["avg_corners_in_match"] == 10.0 and t["pct_matches_over_9.5_corners"] == 100.0
+        assert len(t["matches"]) == 10 and t["matches"][0]["cards_for"] == 4
+
+        # find_cards_and_corners: Bayern v Leipzig (high cards) beats Brentford v Fulham (higher corners, few cards)
+        r = await call("find_cards_and_corners", {"days_ahead": 2})
+        print("cards+corners:", [(f["match"], f["over_9.5_corners_pct"], f["expected_cards"],
+                                  f["cards_over_3.5_hit_rate_pct"], f["combined_score_pct"]) for f in r["fixtures"]])
+        assert [f["fixture_id"] for f in r["fixtures"]] == [3, 2, 1]
+        assert r["fixtures"][0]["combined_score_pct"] == 62.0
+        assert r["fixtures"][2]["cards_over_3.5_hit_rate_pct"] == 0.0  # Brentford/Fulham: 2-3 card games
+
+        r = await call("find_top_fixtures", {"market": "corners"})
+        assert r["fixtures"][0]["home_id"] == 10
     print("ALL TESTS PASSED")
 
 

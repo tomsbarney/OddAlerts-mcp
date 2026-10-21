@@ -36,8 +36,9 @@ mcp = MCPServer(
         "Tools for OddAlerts football data. To find the best fixtures for a market, "
         "call find_top_fixtures with market='goals', 'corners' or 'btts' and an optional line "
         "(e.g. 2.5 goals, 9.5 corners). Use rank_by='edge' to find value against bookmaker prices. "
-        "OddAlerts has no card probabilities or odds; for cards, check referee and head-to-head via "
-        "get_fixture. Probabilities are OddAlerts model outputs, not certainties."
+        "OddAlerts has no card probabilities or odds. For cards, use team_form (each team's average "
+        "cards and corners across its recent matches) or find_cards_and_corners (ranks upcoming games "
+        "for corners and cards together). Probabilities are OddAlerts model outputs, not certainties."
     ),
 )
 
@@ -231,9 +232,8 @@ async def find_top_fixtures(
         return {
             "message": (
                 "OddAlerts' API has no card probabilities and no card odds, so fixtures can't be ranked "
-                "for cards automatically. What is available: the referee and past card counts in "
-                "head-to-head meetings (get_fixture with include='referee,h2h'), and card counts "
-                "in finished matches. Shortlist fixtures (e.g. derbies, relegation games) and check those."
+                "on a card market. Use find_cards_and_corners to rank games by corners probability "
+                "and both teams' recent card averages, or team_form for any team's card and corner record."
             ),
             "fixtures": [],
         }
@@ -272,6 +272,8 @@ async def find_top_fixtures(
             "match": f"{f.get('home_name')} vs {f.get('away_name')}",
             "kickoff": _ko(f),
             "competition_id": f.get("competition_id"),
+            "home_id": f.get("home_id"),
+            "away_id": f.get("away_id"),
             "league_positions": f"{f.get('home_position')} v {f.get('away_position')}",
             "probability_pct": prob,
             **val,
@@ -380,6 +382,226 @@ async def simulate_fixtures(fixture_ids: list[int]) -> dict[str, Any]:
         payload = await _get("predictions/generate/multiple", {"ids": ",".join(map(str, batch))})
         out.extend(_data(payload))
     return {"simulations": out}
+
+
+# ----------------------------------------------------- team form (cards etc.)
+
+FORM_CONCURRENCY = 5  # parallel /fixtures/team calls; OddAlerts allows ~300/min
+
+
+def _side_stat(stats: dict[str, Any], side: str, *names: str) -> float | None:
+    """Sum stats like home_yellow_cards + home_red_cards; None if none of them are present."""
+    vals = [_num(stats.get(f"{side}_{n}")) for n in names]
+    vals = [v for v in vals if v is not None]
+    return sum(vals) if vals else None
+
+
+def _match_line(f: dict[str, Any], team_id: int) -> dict[str, Any] | None:
+    """Cards and corners for/against one team in one finished fixture, or None if no stats."""
+    stats = f.get("stats") or {}
+    if not isinstance(stats, dict):
+        return None
+    is_home = f.get("home_id") == team_id
+    us, them = ("home", "away") if is_home else ("away", "home")
+    cards_for = _side_stat(stats, us, "yellow_cards", "red_cards")
+    cards_against = _side_stat(stats, them, "yellow_cards", "red_cards")
+    corners_for = _num(stats.get(f"{us}_corners"))
+    corners_against = _num(stats.get(f"{them}_corners"))
+    if cards_for is None and corners_for is None:
+        return None
+    return {
+        "date": f.get("date") or f.get("ko_human"),
+        "opponent": f.get("away_name") if is_home else f.get("home_name"),
+        "venue": "H" if is_home else "A",
+        "score": f"{f.get('home_goals')}-{f.get('away_goals')}",
+        "cards_for": cards_for, "cards_against": cards_against,
+        "corners_for": corners_for, "corners_against": corners_against,
+    }
+
+
+def _avg(values: list[float | None]) -> float | None:
+    vals = [v for v in values if v is not None]
+    return round(sum(vals) / len(vals), 2) if vals else None
+
+
+def _rate(values: list[float | None], line: float) -> float | None:
+    vals = [v for v in values if v is not None]
+    return round(100 * sum(v > line for v in vals) / len(vals), 1) if vals else None
+
+
+def _total(m: dict[str, Any], kind: str) -> float | None:
+    a, b = m[f"{kind}_for"], m[f"{kind}_against"]
+    return a + b if a is not None and b is not None else None
+
+
+async def _team_form(
+    team_id: int, *, last_n: int, competitions: str | None,
+    cards_line: float, corners_line: float, include_matches: bool,
+) -> dict[str, Any]:
+    """Average cards and corners over a team's last N finished, non-friendly matches."""
+    payload = await _get(f"fixtures/team/{team_id}", {
+        "include": "stats", "competitions": competitions, "order": "desc",
+        "to": int(time.time()), "per_page": min(250, max(last_n * 3, 30)),
+    })
+    matches: list[dict[str, Any]] = []
+    name = None
+    for f in _data(payload):
+        if name is None:
+            name = f.get("home_name") if f.get("home_id") == team_id else f.get("away_name")
+        if f.get("is_friendly") or f.get("home_goals") is None or (f.get("unix") or 0) > time.time():
+            continue
+        line = _match_line(f, team_id)
+        if line:
+            matches.append(line)
+        if len(matches) >= last_n:
+            break
+
+    cards_total = [_total(m, "cards") for m in matches]
+    corners_total = [_total(m, "corners") for m in matches]
+    out: dict[str, Any] = {
+        "team_id": team_id,
+        "team": name,
+        "matches_used": len(matches),
+        "avg_cards_in_match": _avg(cards_total),
+        "avg_cards_for": _avg([m["cards_for"] for m in matches]),
+        "avg_cards_against": _avg([m["cards_against"] for m in matches]),
+        f"pct_matches_over_{cards_line:g}_cards": _rate(cards_total, cards_line),
+        "avg_corners_in_match": _avg(corners_total),
+        "avg_corners_for": _avg([m["corners_for"] for m in matches]),
+        "avg_corners_against": _avg([m["corners_against"] for m in matches]),
+        f"pct_matches_over_{corners_line:g}_corners": _rate(corners_total, corners_line),
+    }
+    if include_matches:
+        out["matches"] = matches
+    return out
+
+
+async def _forms(team_ids: list[int], **kw: Any) -> dict[int, dict[str, Any]]:
+    """Fetch several teams' form in parallel (bounded), returning errors per team instead of failing."""
+    sem = asyncio.Semaphore(FORM_CONCURRENCY)
+
+    async def one(tid: int) -> tuple[int, dict[str, Any]]:
+        async with sem:
+            try:
+                return tid, await _team_form(tid, **kw)
+            except OddAlertsError as e:
+                return tid, {"team_id": tid, "error": str(e), "matches_used": 0}
+
+    return dict(await asyncio.gather(*(one(t) for t in dict.fromkeys(team_ids))))
+
+
+@mcp.tool()
+async def team_form(
+    team_ids: list[int],
+    last_n: int = 10,
+    cards_line: float = 3.5,
+    corners_line: float = 9.5,
+    competitions: str | None = None,
+    include_matches: bool = False,
+) -> dict[str, Any]:
+    """Each team's average cards and corners across its recent finished matches (all opponents, not just head-to-head).
+
+    Cards = yellow + red cards shown in the match. For each team returns averages for the whole
+    match (both sides), for the team, and against it, plus how often the match total went over the lines.
+    Friendlies are skipped.
+
+    Args:
+        team_ids: OddAlerts team IDs (home_id / away_id from list_fixtures or get_fixture). Up to 30.
+        last_n: How many recent matches to average (default 10).
+        cards_line / corners_line: Lines for the "% of matches over" figures.
+        competitions: Optional comma-separated competition IDs to restrict the sample (e.g. league only).
+        include_matches: Also return the match-by-match numbers.
+    """
+    forms = await _forms(team_ids[:30], last_n=max(1, min(last_n, 40)), competitions=competitions,
+                         cards_line=cards_line, corners_line=corners_line, include_matches=include_matches)
+    return {"teams": list(forms.values()),
+            "note": "Cards count yellow + red cards. Averages use finished, non-friendly matches with stats."}
+
+
+@mcp.tool()
+async def find_cards_and_corners(
+    days_ahead: float = 1,
+    corners_line: float = 9.5,
+    cards_line: float = 3.5,
+    shortlist: int = 20,
+    last_n: int = 10,
+    min_matches: int = 5,
+    senior_men_only: bool = True,
+    competitions: str | None = None,
+    has_odds: bool = True,
+    limit: int = 10,
+    max_pages: int = 4,
+) -> dict[str, Any]:
+    """Rank upcoming fixtures for a high chance of BOTH corners and cards in the same game.
+
+    Corners: OddAlerts' over-X.5 corners probability. Cards: OddAlerts has no card model, so the
+    tool uses both teams' recent form (all matches, not head-to-head) — the average cards in their
+    games and how often those games went over the cards line. The shortlist is the top fixtures by
+    corners probability; each is then scored as corners_probability x cards_hit_rate (treating the
+    two as independent, so it is an indicator, not a true joint probability).
+
+    Args:
+        days_ahead: Window to scan (1 = roughly the next 24 hours).
+        corners_line: Corners line, 4.5-11.5 (default 9.5).
+        cards_line: Cards line for the hit rate (default 3.5, i.e. 4+ cards).
+        shortlist: How many top corners fixtures to check for cards (2 API calls each).
+        last_n: Recent matches per team to average.
+        min_matches: Skip fixtures where either team has fewer matches with stats than this.
+        senior_men_only / competitions / has_odds / max_pages: As in find_top_fixtures.
+        limit: How many fixtures to return.
+    """
+    corners = await find_top_fixtures(
+        market="corners", line=corners_line, days_ahead=days_ahead, senior_men_only=senior_men_only,
+        competitions=competitions, has_odds=has_odds, limit=max(1, min(shortlist, 40)), max_pages=max_pages,
+    )
+    picks = corners.get("fixtures") or []
+    if not picks:
+        return {"message": corners.get("message") or "No fixtures with corner probabilities in that window.", "fixtures": []}
+
+    team_ids = [t for p in picks for t in (p.get("home_id"), p.get("away_id")) if t]
+    forms = await _forms(team_ids, last_n=max(1, min(last_n, 40)), competitions=None,
+                         cards_line=cards_line, corners_line=corners_line, include_matches=False)
+    rate_key = f"pct_matches_over_{cards_line:g}_cards"
+
+    rows, skipped = [], []
+    for p in picks:
+        h, a = forms.get(p.get("home_id"), {}), forms.get(p.get("away_id"), {})
+        if min(h.get("matches_used", 0), a.get("matches_used", 0)) < min_matches:
+            skipped.append(p["match"])
+            continue
+        rates = [x for x in (h.get(rate_key), a.get(rate_key)) if x is not None]
+        exp_cards = _avg([h.get("avg_cards_in_match"), a.get("avg_cards_in_match")])
+        if not rates or exp_cards is None:
+            skipped.append(p["match"])
+            continue
+        cards_rate = round(sum(rates) / len(rates), 1)
+        rows.append({
+            "fixture_id": p["fixture_id"],
+            "match": p["match"],
+            "kickoff": p["kickoff"],
+            "competition_id": p["competition_id"],
+            "referee": p.get("referee"),
+            f"over_{corners_line:g}_corners_pct": p["probability_pct"],
+            "corners_over_odds": p.get("over_odds"),
+            "corners_edge_pct": p.get("edge_pct"),
+            "expected_cards": exp_cards,
+            f"cards_over_{cards_line:g}_hit_rate_pct": cards_rate,
+            "home_cards": {"in_match": h.get("avg_cards_in_match"), "for": h.get("avg_cards_for"), "against": h.get("avg_cards_against")},
+            "away_cards": {"in_match": a.get("avg_cards_in_match"), "for": a.get("avg_cards_for"), "against": a.get("avg_cards_against")},
+            "form_corners_in_match": _avg([h.get("avg_corners_in_match"), a.get("avg_corners_in_match")]),
+            "combined_score_pct": round(p["probability_pct"] * cards_rate / 100, 1),
+        })
+
+    rows.sort(key=lambda r: r["combined_score_pct"], reverse=True)
+    return {
+        "corners_market": f"Over {corners_line:g} corners (OddAlerts model)",
+        "cards_line": f"Over {cards_line:g} cards (yellow + red), from both teams' last {last_n} matches",
+        "checked": len(picks),
+        "skipped_thin_data": skipped,
+        "note": ("combined_score_pct = corners probability x cards hit rate, assuming independence. "
+                 "It ranks games; it is not a calibrated probability. Referee strictness is not included."),
+        "fixtures": rows[:limit],
+    }
 
 
 # -------------------------------------------------------------------- main
